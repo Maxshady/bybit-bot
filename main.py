@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
+"""
+Bybit Volume Spike Bot - WebSocket версия
+Получает данные в реальном времени через WebSocket
+"""
+import json
 import time
-import requests
 import logging
 import os
+import threading
+import requests
 from datetime import datetime
 from collections import defaultdict
+
+import websocket
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-MIN_VOLUME_USD   = 20_000_000
-SPIKE_MULTIPLIER = 2.5
-CHECK_INTERVAL   = 60
-HISTORY_PERIODS  = 10
-TOP_COINS_COUNT  = 20
-ALERT_COOLDOWN   = 300
+MIN_VOLUME_USD   = 20_000_000   # минимальный объём 20 млн $
+SPIKE_MULTIPLIER = 2.5          # всплеск = рост объёма в X раз
+ALERT_COOLDOWN   = 300          # антиспам — не повторять сигнал N секунд
+TOP_REPORT_EVERY = 3600         # топ отчёт каждые N секунд (1 час)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,235 +29,255 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-volume_history = defaultdict(list)
-alerted_coins  = {}
+# Хранилище данных по монетам
+tickers = {}          # symbol -> последние данные
+volume_prev = {}      # symbol -> предыдущий объём (для расчёта всплеска)
+alerted = {}          # symbol -> время последнего сигнала
+last_report = 0       # время последнего топ-отчёта
+lock = threading.Lock()
 
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("Токены не заданы!")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }, timeout=15)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=15
+        )
         if r.ok:
             log.info("Telegram: отправлено")
         else:
-            log.error(f"Telegram error: {r.text}")
+            log.error(f"Telegram: {r.text}")
     except Exception as e:
-        log.error(f"Telegram failed: {e}")
+        log.error(f"Telegram error: {e}")
 
 
-def get_bybit_tickers():
-    """
-    Пробуем несколько способов получить данные Bybit.
-    1. Прямой API
-    2. Через CoinGecko (открытый, не блокирует)
-    """
-
-    # Способ 1 — прямой Bybit с разными заголовками
-    headers = {
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": "python-requests/2.31.0",
-        "Cache-Control": "no-cache",
-    }
-    for url in [
-        "https://api.bybit.com/v5/market/tickers",
-        "https://api.bytick.com/v5/market/tickers",
-        "https://api2.bybit.com/v5/market/tickers",
-    ]:
-        try:
-            r = requests.get(url, params={"category": "linear"}, headers=headers, timeout=20)
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                data = r.json()
-                if data.get("retCode") == 0:
-                    tickers = data["result"]["list"]
-                    log.info(f"Bybit OK: {len(tickers)} тикеров ({url})")
-                    return tickers, "bybit"
-        except Exception as e:
-            log.warning(f"Bybit {url} failed: {e}")
-
-    # Способ 2 — CoinGecko (бесплатный открытый API)
-    log.info("Пробую CoinGecko...")
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "order": "volume_desc",
-                "per_page": 250,
-                "page": 1,
-                "sparkline": False,
-            },
-            timeout=20
-        )
-        if r.status_code == 200:
-            coins = r.json()
-            log.info(f"CoinGecko OK: {len(coins)} монет")
-            return coins, "coingecko"
-    except Exception as e:
-        log.error(f"CoinGecko failed: {e}")
-
-    return [], None
-
-
-def parse_bybit_ticker(t: dict):
-    symbol = t.get("symbol", "")
-    if not symbol.endswith("USDT"):
-        return None
-    try:
-        volume_24h = float(t.get("turnover24h") or 0)
-        price      = float(t.get("lastPrice")   or 0)
-        change_pct = float(t.get("price24hPcnt") or 0) * 100
-        oi_value   = float(t.get("openInterestValue") or 0)
-    except (ValueError, TypeError):
-        return None
-    if price <= 0:
-        return None
-    return {"symbol": symbol, "price": price, "volume_24h": volume_24h,
-            "change_pct": change_pct, "oi_value": oi_value}
-
-
-def parse_coingecko_ticker(t: dict):
-    symbol = (t.get("symbol") or "").upper() + "USDT"
-    try:
-        volume_24h = float(t.get("total_volume") or 0)
-        price      = float(t.get("current_price") or 0)
-        change_pct = float(t.get("price_change_percentage_24h") or 0)
-    except (ValueError, TypeError):
-        return None
-    if price <= 0 or volume_24h <= 0:
-        return None
-    return {"symbol": symbol, "price": price, "volume_24h": volume_24h,
-            "change_pct": change_pct, "oi_value": 0}
-
-
-def fmt_volume(v: float) -> str:
+def fmt_vol(v: float) -> str:
     if v >= 1_000_000_000:
-        return f"{v/1_000_000_000:.1f}B$"
+        return f"{v/1_000_000_000:.2f}B$"
     if v >= 1_000_000:
         return f"{v/1_000_000:.1f}M$"
     return f"{v:,.0f}$"
 
 
-def check_spikes(tickers):
-    spikes = []
+def check_spike(symbol: str, data: dict):
+    """Проверить всплеск объёма для монеты"""
+    global last_report
+
     now = time.time()
-    for t in tickers:
-        symbol = t["symbol"]
-        vol    = t["volume_24h"]
-        volume_history[symbol].append(vol)
-        if len(volume_history[symbol]) > HISTORY_PERIODS:
-            volume_history[symbol].pop(0)
-        if len(volume_history[symbol]) < 3:
-            continue
-        history = volume_history[symbol][:-1]
-        avg_vol = sum(history) / len(history)
-        if avg_vol <= 0:
-            continue
-        ratio = vol / avg_vol
-        if vol >= MIN_VOLUME_USD and ratio >= SPIKE_MULTIPLIER:
-            last_alert = alerted_coins.get(symbol, 0)
-            if now - last_alert < ALERT_COOLDOWN:
-                continue
-            alerted_coins[symbol] = now
-            spikes.append({**t, "avg_vol": avg_vol, "ratio": ratio})
-    return spikes
+    vol = data.get("volume_24h", 0)
+    price = data.get("price", 0)
+    change = data.get("change_pct", 0)
 
+    if vol < MIN_VOLUME_USD or price <= 0:
+        return
 
-def send_spike_alert(spike: dict):
-    symbol      = spike["symbol"].replace("USDT", "")
-    change_sign = "+" if spike["change_pct"] >= 0 else ""
-    direction   = "РОСТ" if spike["change_pct"] >= 0 else "ПАДЕНИЕ"
+    prev = volume_prev.get(symbol)
+    volume_prev[symbol] = vol
+
+    if prev is None or prev <= 0:
+        return
+
+    ratio = vol / prev
+    if ratio < SPIKE_MULTIPLIER:
+        return
+
+    # Антиспам
+    last_alert = alerted.get(symbol, 0)
+    if now - last_alert < ALERT_COOLDOWN:
+        return
+
+    alerted[symbol] = now
+    sign = "+" if change >= 0 else ""
+    direction = "РОСТ" if change >= 0 else "ПАДЕНИЕ"
+
     msg = (
-        f"<b>ВСПЛЕСК ОБЪЕМА - {symbol}</b>\n"
-        f"Цена:      <b>{spike['price']:.6g} USDT</b>\n"
-        f"Изменение: <b>{change_sign}{spike['change_pct']:.1f}%</b> ({direction})\n"
-        f"Объем 24ч: <b>{fmt_volume(spike['volume_24h'])}</b>\n"
-        f"Средний:   {fmt_volume(spike['avg_vol'])}\n"
-        f"Всплеск:   <b>x{spike['ratio']:.1f}</b>\n"
+        f"<b>ВСПЛЕСК ОБЪЕМА - {symbol.replace('USDT','')}</b>\n"
+        f"Цена:      <b>{price:.6g} USDT</b>\n"
+        f"Изменение: <b>{sign}{change:.1f}%</b> ({direction})\n"
+        f"Объем:     <b>{fmt_vol(vol)}</b>\n"
+        f"Был:       {fmt_vol(prev)}\n"
+        f"Всплеск:   <b>x{ratio:.1f}</b>\n"
         f"Время: {datetime.now().strftime('%H:%M:%S')}"
     )
     send_telegram(msg)
-    log.info(f"SPIKE: {symbol} | x{spike['ratio']:.1f}")
+    log.info(f"SPIKE: {symbol} | x{ratio:.1f} | {fmt_vol(vol)}")
 
 
-def send_top_report(tickers, source):
-    filtered = [t for t in tickers if t["volume_24h"] >= MIN_VOLUME_USD]
-    top = sorted(filtered, key=lambda x: x["volume_24h"], reverse=True)[:TOP_COINS_COUNT]
+def send_top_report():
+    """Топ монет по объёму"""
+    with lock:
+        data = dict(tickers)
+
+    filtered = [(s, d) for s, d in data.items() if d.get("volume_24h", 0) >= MIN_VOLUME_USD]
+    top = sorted(filtered, key=lambda x: x[1]["volume_24h"], reverse=True)[:20]
+
     if not top:
         return
-    src = "Bybit" if source == "bybit" else "CoinGecko"
-    lines = [f"<b>ТОП-{TOP_COINS_COUNT} ПО ОБЪЕМУ | {datetime.now().strftime('%H:%M')} ({src})</b>\n"]
-    for i, t in enumerate(top, 1):
-        symbol = t["symbol"].replace("USDT", "")
-        vol    = fmt_volume(t["volume_24h"])
-        chg    = t["change_pct"]
+
+    lines = [f"<b>ТОП-20 ПО ОБЪЕМУ | {datetime.now().strftime('%H:%M')}</b>\n"]
+    for i, (symbol, d) in enumerate(top, 1):
+        name   = symbol.replace("USDT", "")
+        vol    = fmt_vol(d["volume_24h"])
+        chg    = d.get("change_pct", 0)
         sign   = "+" if chg >= 0 else ""
         arrow  = "↑" if chg >= 0 else "↓"
-        lines.append(f"{i:2}. <b>{symbol:<12}</b> {vol:<10} {arrow}{sign}{chg:.1f}%")
+        lines.append(f"{i:2}. <b>{name:<12}</b> {vol:<10} {arrow}{sign}{chg:.1f}%")
+
     send_telegram("\n".join(lines))
 
 
-def main():
-    log.info("Bybit Volume Bot запущен")
-    log.info(f"TELEGRAM_TOKEN:   {'OK' if TELEGRAM_TOKEN else 'НЕ ЗАДАН!'}")
-    log.info(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'НЕ ЗАДАН!'}")
+def on_message(ws, message):
+    """Обработка сообщений WebSocket"""
+    global last_report
+    try:
+        data = json.loads(message)
 
+        # Пинг-понг
+        if data.get("op") == "ping" or data.get("ret_msg") == "pong":
+            return
+
+        topic = data.get("topic", "")
+        if not topic.startswith("tickers."):
+            return
+
+        ticker_data = data.get("data", {})
+        symbol = ticker_data.get("symbol", "")
+
+        if not symbol.endswith("USDT"):
+            return
+
+        # Достаём нужные поля
+        try:
+            price      = float(ticker_data.get("lastPrice")        or 0)
+            vol_24h    = float(ticker_data.get("turnover24h")       or 0)
+            change_pct = float(ticker_data.get("price24hPcnt")      or 0) * 100
+            oi_value   = float(ticker_data.get("openInterestValue") or 0)
+        except (ValueError, TypeError):
+            return
+
+        if price <= 0:
+            return
+
+        ticker_info = {
+            "price":      price,
+            "volume_24h": vol_24h,
+            "change_pct": change_pct,
+            "oi_value":   oi_value,
+            "updated":    time.time(),
+        }
+
+        with lock:
+            tickers[symbol] = ticker_info
+
+        # Проверяем всплеск
+        check_spike(symbol, ticker_info)
+
+        # Топ отчёт каждый час
+        now = time.time()
+        if now - last_report > TOP_REPORT_EVERY:
+            last_report = now
+            threading.Thread(target=send_top_report, daemon=True).start()
+
+    except Exception as e:
+        log.error(f"on_message error: {e}")
+
+
+def on_error(ws, error):
+    log.error(f"WebSocket error: {error}")
+
+
+def on_close(ws, close_status_code, close_msg):
+    log.warning(f"WebSocket закрыт: {close_status_code} {close_msg}")
+
+
+def on_open(ws):
+    """Подписываемся на все тикеры при открытии соединения"""
+    log.info("WebSocket подключён — подписываемся на тикеры...")
+
+    # Сначала получаем список всех USDT монет
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=15
+        )
+        data = r.json()
+        symbols = [
+            t["symbol"] for t in data["result"]["list"]
+            if t["symbol"].endswith("USDT")
+        ]
+        log.info(f"Найдено {len(symbols)} монет")
+    except Exception as e:
+        log.error(f"Не удалось получить список монет: {e}")
+        # Подписываемся на популярные монеты вручную
+        symbols = [
+            "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
+            "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
+            "LINKUSDT","UNIUSDT","ATOMUSDT","LTCUSDT","ETCUSDT",
+        ]
+
+    # WebSocket принимает максимум 10 символов за раз
+    batch_size = 10
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i+batch_size]
+        args  = [f"tickers.{s}" for s in batch]
+        ws.send(json.dumps({"op": "subscribe", "args": args}))
+        time.sleep(0.1)
+
+    log.info("Подписка оформлена — слушаем рынок в реальном времени")
     send_telegram(
-        f"<b>Bybit Volume Bot запущен!</b>\n"
-        f"Мин. объём: {fmt_volume(MIN_VOLUME_USD)}\n"
-        f"Порог всплеска: x{SPIKE_MULTIPLIER}\n"
-        f"Проверка каждые {CHECK_INTERVAL} сек"
+        f"<b>Bybit Volume Bot запущен (WebSocket)</b>\n"
+        f"Режим: реальное время\n"
+        f"Монет отслеживается: {len(symbols)}\n"
+        f"Мин. объём: {fmt_vol(MIN_VOLUME_USD)}\n"
+        f"Порог всплеска: x{SPIKE_MULTIPLIER}"
     )
 
-    iteration    = 0
-    REPORT_EVERY = 60
-    last_source  = None
 
+def ping_loop(ws):
+    """Держим соединение живым пингами"""
+    while True:
+        time.sleep(20)
+        try:
+            ws.send(json.dumps({"op": "ping"}))
+        except Exception:
+            break
+
+
+def run_websocket():
+    """Запуск WebSocket с автопереподключением"""
+    url = "wss://stream.bybit.com/v5/public/linear"
     while True:
         try:
-            raw_data, source = get_bybit_tickers()
+            log.info(f"Подключаемся к {url}...")
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            # Пинг в отдельном потоке
+            ping_thread = threading.Thread(target=ping_loop, args=(ws,), daemon=True)
+            ping_thread.start()
 
-            if not raw_data:
-                log.error("Нет данных ни от одного источника")
-                time.sleep(CHECK_INTERVAL)
-                continue
+            ws.run_forever(ping_interval=30, ping_timeout=10)
 
-            # Если источник сменился — уведомить
-            if source != last_source:
-                src_name = "Bybit" if source == "bybit" else "CoinGecko (резерв)"
-                send_telegram(f"Источник данных: <b>{src_name}</b>")
-                last_source = source
-
-            # Парсим в зависимости от источника
-            if source == "bybit":
-                tickers = [p for t in raw_data if (p := parse_bybit_ticker(t))]
-            else:
-                tickers = [p for t in raw_data if (p := parse_coingecko_ticker(t))]
-
-            log.info(f"Монет после фильтра: {len(tickers)}")
-
-            spikes = check_spikes(tickers)
-            for spike in spikes:
-                send_spike_alert(spike)
-
-            iteration += 1
-            if iteration % REPORT_EVERY == 0:
-                send_top_report(tickers, source)
-
-            time.sleep(CHECK_INTERVAL)
-
-        except KeyboardInterrupt:
-            break
         except Exception as e:
-            log.error(f"Ошибка: {e}")
-            time.sleep(30)
+            log.error(f"WebSocket упал: {e}")
+
+        log.warning("Переподключаемся через 5 секунд...")
+        time.sleep(5)
+
+
+def main():
+    log.info("Bybit Volume Bot (WebSocket) запускается...")
+    log.info(f"TELEGRAM_TOKEN:   {'OK' if TELEGRAM_TOKEN else 'НЕ ЗАДАН!'}")
+    log.info(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'НЕ ЗАДАН!'}")
+    run_websocket()
 
 
 if __name__ == "__main__":
