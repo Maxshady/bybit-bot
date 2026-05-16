@@ -26,11 +26,6 @@ log = logging.getLogger(__name__)
 volume_history = defaultdict(list)
 alerted_coins  = {}
 
-# Несколько зеркал API на случай блокировки
-BYBIT_ENDPOINTS = [
-    "https://api.bybit.com/v5/market/tickers",
-    "https://api.bytick.com/v5/market/tickers",
-]
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -44,45 +39,68 @@ def send_telegram(message: str):
             "parse_mode": "HTML"
         }, timeout=15)
         if r.ok:
-            log.info("Telegram: сообщение отправлено")
+            log.info("Telegram: отправлено")
         else:
             log.error(f"Telegram error: {r.text}")
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+        log.error(f"Telegram failed: {e}")
 
 
 def get_bybit_tickers():
+    """
+    Пробуем несколько способов получить данные Bybit.
+    1. Прямой API
+    2. Через CoinGecko (открытый, не блокирует)
+    """
+
+    # Способ 1 — прямой Bybit с разными заголовками
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "python-requests/2.31.0",
+        "Cache-Control": "no-cache",
     }
-    for endpoint in BYBIT_ENDPOINTS:
+    for url in [
+        "https://api.bybit.com/v5/market/tickers",
+        "https://api.bytick.com/v5/market/tickers",
+        "https://api2.bybit.com/v5/market/tickers",
+    ]:
         try:
-            r = requests.get(
-                endpoint,
-                params={"category": "linear"},
-                headers=headers,
-                timeout=20
-            )
-            text = r.text.strip()
-            if not text.startswith("{"):
-                log.warning(f"Не JSON от {endpoint}, пробую следующий...")
-                continue
-            data = r.json()
-            if data.get("retCode") != 0:
-                log.error(f"Bybit API error: {data.get('retMsg')}")
-                continue
-            tickers = data["result"]["list"]
-            log.info(f"Получено {len(tickers)} тикеров")
-            return tickers
+            r = requests.get(url, params={"category": "linear"}, headers=headers, timeout=20)
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                data = r.json()
+                if data.get("retCode") == 0:
+                    tickers = data["result"]["list"]
+                    log.info(f"Bybit OK: {len(tickers)} тикеров ({url})")
+                    return tickers, "bybit"
         except Exception as e:
-            log.warning(f"Ошибка {endpoint}: {e}")
-            continue
-    log.error("Все endpoints недоступны")
-    return []
+            log.warning(f"Bybit {url} failed: {e}")
+
+    # Способ 2 — CoinGecko (бесплатный открытый API)
+    log.info("Пробую CoinGecko...")
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "volume_desc",
+                "per_page": 250,
+                "page": 1,
+                "sparkline": False,
+            },
+            timeout=20
+        )
+        if r.status_code == 200:
+            coins = r.json()
+            log.info(f"CoinGecko OK: {len(coins)} монет")
+            return coins, "coingecko"
+    except Exception as e:
+        log.error(f"CoinGecko failed: {e}")
+
+    return [], None
 
 
-def parse_ticker(t: dict):
+def parse_bybit_ticker(t: dict):
     symbol = t.get("symbol", "")
     if not symbol.endswith("USDT"):
         return None
@@ -95,13 +113,22 @@ def parse_ticker(t: dict):
         return None
     if price <= 0:
         return None
-    return {
-        "symbol":     symbol,
-        "price":      price,
-        "volume_24h": volume_24h,
-        "change_pct": change_pct,
-        "oi_value":   oi_value,
-    }
+    return {"symbol": symbol, "price": price, "volume_24h": volume_24h,
+            "change_pct": change_pct, "oi_value": oi_value}
+
+
+def parse_coingecko_ticker(t: dict):
+    symbol = (t.get("symbol") or "").upper() + "USDT"
+    try:
+        volume_24h = float(t.get("total_volume") or 0)
+        price      = float(t.get("current_price") or 0)
+        change_pct = float(t.get("price_change_percentage_24h") or 0)
+    except (ValueError, TypeError):
+        return None
+    if price <= 0 or volume_24h <= 0:
+        return None
+    return {"symbol": symbol, "price": price, "volume_24h": volume_24h,
+            "change_pct": change_pct, "oi_value": 0}
 
 
 def fmt_volume(v: float) -> str:
@@ -138,35 +165,29 @@ def check_spikes(tickers):
 
 
 def send_spike_alert(spike: dict):
-    symbol     = spike["symbol"].replace("USDT", "")
-    price      = spike["price"]
-    vol        = spike["volume_24h"]
-    avg_vol    = spike["avg_vol"]
-    ratio      = spike["ratio"]
-    change_pct = spike["change_pct"]
-    oi_value   = spike["oi_value"]
-    change_sign = "+" if change_pct >= 0 else ""
-    direction   = "РОСТ" if change_pct >= 0 else "ПАДЕНИЕ"
+    symbol      = spike["symbol"].replace("USDT", "")
+    change_sign = "+" if spike["change_pct"] >= 0 else ""
+    direction   = "РОСТ" if spike["change_pct"] >= 0 else "ПАДЕНИЕ"
     msg = (
         f"<b>ВСПЛЕСК ОБЪЕМА - {symbol}</b>\n"
-        f"Цена:      <b>{price:.6g} USDT</b>\n"
-        f"Изменение: <b>{change_sign}{change_pct:.1f}%</b> ({direction})\n"
-        f"Объем 24ч: <b>{fmt_volume(vol)}</b>\n"
-        f"Средний:   {fmt_volume(avg_vol)}\n"
-        f"Всплеск:   <b>x{ratio:.1f}</b>\n"
-        f"ОИ:        {fmt_volume(oi_value)}\n"
+        f"Цена:      <b>{spike['price']:.6g} USDT</b>\n"
+        f"Изменение: <b>{change_sign}{spike['change_pct']:.1f}%</b> ({direction})\n"
+        f"Объем 24ч: <b>{fmt_volume(spike['volume_24h'])}</b>\n"
+        f"Средний:   {fmt_volume(spike['avg_vol'])}\n"
+        f"Всплеск:   <b>x{spike['ratio']:.1f}</b>\n"
         f"Время: {datetime.now().strftime('%H:%M:%S')}"
     )
     send_telegram(msg)
-    log.info(f"SPIKE: {symbol} | x{ratio:.1f}")
+    log.info(f"SPIKE: {symbol} | x{spike['ratio']:.1f}")
 
 
-def send_top_report(tickers):
+def send_top_report(tickers, source):
     filtered = [t for t in tickers if t["volume_24h"] >= MIN_VOLUME_USD]
     top = sorted(filtered, key=lambda x: x["volume_24h"], reverse=True)[:TOP_COINS_COUNT]
     if not top:
         return
-    lines = [f"<b>ТОП-{TOP_COINS_COUNT} ПО ОБЪЕМУ | {datetime.now().strftime('%H:%M')}</b>\n"]
+    src = "Bybit" if source == "bybit" else "CoinGecko"
+    lines = [f"<b>ТОП-{TOP_COINS_COUNT} ПО ОБЪЕМУ | {datetime.now().strftime('%H:%M')} ({src})</b>\n"]
     for i, t in enumerate(top, 1):
         symbol = t["symbol"].replace("USDT", "")
         vol    = fmt_volume(t["volume_24h"])
@@ -186,28 +207,43 @@ def main():
         f"<b>Bybit Volume Bot запущен!</b>\n"
         f"Мин. объём: {fmt_volume(MIN_VOLUME_USD)}\n"
         f"Порог всплеска: x{SPIKE_MULTIPLIER}\n"
-        f"Проверка каждые {CHECK_INTERVAL} сек\n"
-        f"Жду данные (~{HISTORY_PERIODS} мин)..."
+        f"Проверка каждые {CHECK_INTERVAL} сек"
     )
 
     iteration    = 0
     REPORT_EVERY = 60
+    last_source  = None
 
     while True:
         try:
-            raw_tickers = get_bybit_tickers()
-            if not raw_tickers:
+            raw_data, source = get_bybit_tickers()
+
+            if not raw_data:
+                log.error("Нет данных ни от одного источника")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            tickers = [p for t in raw_tickers if (p := parse_ticker(t))]
-            spikes  = check_spikes(tickers)
+            # Если источник сменился — уведомить
+            if source != last_source:
+                src_name = "Bybit" if source == "bybit" else "CoinGecko (резерв)"
+                send_telegram(f"Источник данных: <b>{src_name}</b>")
+                last_source = source
+
+            # Парсим в зависимости от источника
+            if source == "bybit":
+                tickers = [p for t in raw_data if (p := parse_bybit_ticker(t))]
+            else:
+                tickers = [p for t in raw_data if (p := parse_coingecko_ticker(t))]
+
+            log.info(f"Монет после фильтра: {len(tickers)}")
+
+            spikes = check_spikes(tickers)
             for spike in spikes:
                 send_spike_alert(spike)
 
             iteration += 1
             if iteration % REPORT_EVERY == 0:
-                send_top_report(tickers)
+                send_top_report(tickers, source)
 
             time.sleep(CHECK_INTERVAL)
 
