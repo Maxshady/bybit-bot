@@ -5,29 +5,33 @@ import logging
 import os
 from datetime import datetime
 from collections import defaultdict
- 
-# Читаем токены из переменных окружения Railway
+
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
- 
+
 MIN_VOLUME_USD   = 20_000_000
 SPIKE_MULTIPLIER = 2.5
 CHECK_INTERVAL   = 60
 HISTORY_PERIODS  = 10
 TOP_COINS_COUNT  = 20
 ALERT_COOLDOWN   = 300
- 
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     datefmt='%H:%M:%S'
 )
 log = logging.getLogger(__name__)
- 
+
 volume_history = defaultdict(list)
 alerted_coins  = {}
- 
- 
+
+# Несколько зеркал API на случай блокировки
+BYBIT_ENDPOINTS = [
+    "https://api.bybit.com/v5/market/tickers",
+    "https://api.bytick.com/v5/market/tickers",
+]
+
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("Токены не заданы!")
@@ -45,35 +49,39 @@ def send_telegram(message: str):
             log.error(f"Telegram error: {r.text}")
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
- 
- 
+
+
 def get_bybit_tickers():
-    """Получить тикеры через v5 API Bybit"""
-    url = "https://api.bybit.com/v5/market/tickers"
-    headers = {"Accept": "application/json"}
-    try:
-        r = requests.get(
-            url,
-            params={"category": "linear"},
-            headers=headers,
-            timeout=15
-        )
-        # Проверяем что ответ — валидный JSON
-        data = r.json()
-        if data.get("retCode") != 0:
-            log.error(f"Bybit API error: {data.get('retMsg')}")
-            return []
-        tickers = data["result"]["list"]
-        log.info(f"Получено {len(tickers)} тикеров от Bybit")
-        return tickers
-    except requests.exceptions.JSONDecodeError as e:
-        log.error(f"Bybit вернул не JSON: {e}")
-        return []
-    except Exception as e:
-        log.error(f"Bybit request failed: {e}")
-        return []
- 
- 
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    for endpoint in BYBIT_ENDPOINTS:
+        try:
+            r = requests.get(
+                endpoint,
+                params={"category": "linear"},
+                headers=headers,
+                timeout=20
+            )
+            text = r.text.strip()
+            if not text.startswith("{"):
+                log.warning(f"Не JSON от {endpoint}, пробую следующий...")
+                continue
+            data = r.json()
+            if data.get("retCode") != 0:
+                log.error(f"Bybit API error: {data.get('retMsg')}")
+                continue
+            tickers = data["result"]["list"]
+            log.info(f"Получено {len(tickers)} тикеров")
+            return tickers
+        except Exception as e:
+            log.warning(f"Ошибка {endpoint}: {e}")
+            continue
+    log.error("Все endpoints недоступны")
+    return []
+
+
 def parse_ticker(t: dict):
     symbol = t.get("symbol", "")
     if not symbol.endswith("USDT"):
@@ -94,16 +102,16 @@ def parse_ticker(t: dict):
         "change_pct": change_pct,
         "oi_value":   oi_value,
     }
- 
- 
+
+
 def fmt_volume(v: float) -> str:
     if v >= 1_000_000_000:
         return f"{v/1_000_000_000:.1f}B$"
     if v >= 1_000_000:
         return f"{v/1_000_000:.1f}M$"
     return f"{v:,.0f}$"
- 
- 
+
+
 def check_spikes(tickers):
     spikes = []
     now = time.time()
@@ -127,8 +135,8 @@ def check_spikes(tickers):
             alerted_coins[symbol] = now
             spikes.append({**t, "avg_vol": avg_vol, "ratio": ratio})
     return spikes
- 
- 
+
+
 def send_spike_alert(spike: dict):
     symbol     = spike["symbol"].replace("USDT", "")
     price      = spike["price"]
@@ -138,8 +146,7 @@ def send_spike_alert(spike: dict):
     change_pct = spike["change_pct"]
     oi_value   = spike["oi_value"]
     change_sign = "+" if change_pct >= 0 else ""
-    direction   = "RОСТ" if change_pct >= 0 else "ПАДЕНИЕ"
- 
+    direction   = "РОСТ" if change_pct >= 0 else "ПАДЕНИЕ"
     msg = (
         f"<b>ВСПЛЕСК ОБЪЕМА - {symbol}</b>\n"
         f"Цена:      <b>{price:.6g} USDT</b>\n"
@@ -151,9 +158,9 @@ def send_spike_alert(spike: dict):
         f"Время: {datetime.now().strftime('%H:%M:%S')}"
     )
     send_telegram(msg)
-    log.info(f"SPIKE: {symbol} | vol={fmt_volume(vol)} | x{ratio:.1f}")
- 
- 
+    log.info(f"SPIKE: {symbol} | x{ratio:.1f}")
+
+
 def send_top_report(tickers):
     filtered = [t for t in tickers if t["volume_24h"] >= MIN_VOLUME_USD]
     top = sorted(filtered, key=lambda x: x["volume_24h"], reverse=True)[:TOP_COINS_COUNT]
@@ -168,52 +175,48 @@ def send_top_report(tickers):
         arrow  = "↑" if chg >= 0 else "↓"
         lines.append(f"{i:2}. <b>{symbol:<12}</b> {vol:<10} {arrow}{sign}{chg:.1f}%")
     send_telegram("\n".join(lines))
- 
- 
+
+
 def main():
     log.info("Bybit Volume Bot запущен")
     log.info(f"TELEGRAM_TOKEN:   {'OK' if TELEGRAM_TOKEN else 'НЕ ЗАДАН!'}")
     log.info(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'НЕ ЗАДАН!'}")
-    log.info(f"Мин. объём: {fmt_volume(MIN_VOLUME_USD)}")
-    log.info(f"Порог всплеска: x{SPIKE_MULTIPLIER}")
- 
+
     send_telegram(
         f"<b>Bybit Volume Bot запущен!</b>\n"
         f"Мин. объём: {fmt_volume(MIN_VOLUME_USD)}\n"
         f"Порог всплеска: x{SPIKE_MULTIPLIER}\n"
         f"Проверка каждые {CHECK_INTERVAL} сек\n"
-        f"Жду данные для калибровки (~{HISTORY_PERIODS} мин)..."
+        f"Жду данные (~{HISTORY_PERIODS} мин)..."
     )
- 
-    iteration = 0
+
+    iteration    = 0
     REPORT_EVERY = 60
- 
+
     while True:
         try:
             raw_tickers = get_bybit_tickers()
             if not raw_tickers:
                 time.sleep(CHECK_INTERVAL)
                 continue
- 
+
             tickers = [p for t in raw_tickers if (p := parse_ticker(t))]
- 
-            spikes = check_spikes(tickers)
+            spikes  = check_spikes(tickers)
             for spike in spikes:
                 send_spike_alert(spike)
- 
+
             iteration += 1
             if iteration % REPORT_EVERY == 0:
                 send_top_report(tickers)
- 
+
             time.sleep(CHECK_INTERVAL)
- 
+
         except KeyboardInterrupt:
-            log.info("Остановлено")
             break
         except Exception as e:
             log.error(f"Ошибка: {e}")
             time.sleep(30)
- 
- 
+
+
 if __name__ == "__main__":
     main()
