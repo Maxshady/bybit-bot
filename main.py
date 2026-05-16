@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Bybit Volume Spike Bot - WebSocket + HTTP сервер
+Bybit Volume Spike Bot - все монеты + новые листинги
+Подписывается на wildcard поток — получает ВСЕ монеты автоматически
 """
 import json
 import time
@@ -30,23 +31,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-tickers    = {}
+tickers     = {}
 volume_prev = {}
-alerted    = {}
+alerted     = {}
 last_report = 0
 lock        = threading.Lock()
 start_time  = datetime.now()
 spike_count = 0
+known_coins = set()  # для отслеживания новых листингов
 
 
-# ── HTTP сервер (для Railway) ────────────────────────────
+# ── HTTP сервер ──────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        with lock:
+            count = len(tickers)
         body = json.dumps({
-            "status": "running",
-            "uptime": str(datetime.now() - start_time),
-            "tickers_tracked": len(tickers),
-            "spikes_found": spike_count,
+            "status":    "running",
+            "uptime":    str(datetime.now() - start_time),
+            "coins":     count,
+            "spikes":    spike_count,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -54,12 +58,12 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, *args):
-        pass  # отключаем лог HTTP запросов
+        pass
 
 
 def run_http():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    log.info(f"HTTP сервер запущен на порту {PORT}")
+    log.info(f"HTTP сервер на порту {PORT}")
     server.serve_forever()
 
 
@@ -89,15 +93,41 @@ def fmt_vol(v: float) -> str:
     return f"{v:,.0f}$"
 
 
-# ── Проверка всплеска ────────────────────────────────────
+# ── Проверка нового листинга ─────────────────────────────
+def check_new_listing(symbol: str, price: float, vol: float):
+    if symbol in known_coins:
+        return
+    known_coins.add(symbol)
+    # Не оповещаем при первом запуске (когда known_coins пустой изначально)
+    if len(known_coins) <= 50:
+        return
+    name = symbol.replace("USDT", "")
+    log.info(f"НОВЫЙ ЛИСТИНГ: {symbol}")
+    send_telegram(
+        f"<b>НОВЫЙ ЛИСТИНГ на Bybit!</b>\n"
+        f"Монета: <b>{name}</b>\n"
+        f"Цена:   <b>{price:.6g} USDT</b>\n"
+        f"Объём:  {fmt_vol(vol)}\n"
+        f"Время:  {datetime.now().strftime('%H:%M:%S')}\n"
+        f"Bybit: https://www.bybit.com/trade/usdt/{symbol}"
+    )
+
+
+# ── Проверка всплеска объёма ─────────────────────────────
 def check_spike(symbol: str, data: dict):
     global spike_count, last_report
-    now = time.time()
-    vol   = data.get("volume_24h", 0)
-    price = data.get("price", 0)
+    now    = time.time()
+    vol    = data.get("volume_24h", 0)
+    price  = data.get("price", 0)
     change = data.get("change_pct", 0)
 
-    if vol < MIN_VOLUME_USD or price <= 0:
+    if price <= 0:
+        return
+
+    # Проверка нового листинга
+    check_new_listing(symbol, price, vol)
+
+    if vol < MIN_VOLUME_USD:
         return
 
     prev = volume_prev.get(symbol)
@@ -123,10 +153,11 @@ def check_spike(symbol: str, data: dict):
         f"<b>ВСПЛЕСК ОБЪЕМА - {symbol.replace('USDT','')}</b>\n"
         f"Цена:      <b>{price:.6g} USDT</b>\n"
         f"Изменение: <b>{sign}{change:.1f}%</b> ({direction})\n"
-        f"Объем:     <b>{fmt_vol(vol)}</b>\n"
+        f"Объём:     <b>{fmt_vol(vol)}</b>\n"
         f"Был:       {fmt_vol(prev)}\n"
         f"Всплеск:   <b>x{ratio:.1f}</b>\n"
-        f"Время: {datetime.now().strftime('%H:%M:%S')}"
+        f"Время: {datetime.now().strftime('%H:%M:%S')}\n"
+        f"Bybit: https://www.bybit.com/trade/usdt/{symbol}"
     )
     send_telegram(msg)
     log.info(f"SPIKE: {symbol} x{ratio:.1f} | {fmt_vol(vol)}")
@@ -144,7 +175,8 @@ def send_top_report():
     top = sorted(filtered, key=lambda x: x[1]["volume_24h"], reverse=True)[:20]
     if not top:
         return
-    lines = [f"<b>ТОП-20 ПО ОБЪЕМУ | {datetime.now().strftime('%H:%M')}</b>\n"]
+    lines = [f"<b>ТОП-20 ПО ОБЪЕМУ | {datetime.now().strftime('%H:%M')}</b>\n"
+             f"Всего монет: {len(data)}\n"]
     for i, (symbol, d) in enumerate(top, 1):
         name  = symbol.replace("USDT", "")
         vol   = fmt_vol(d["volume_24h"])
@@ -155,32 +187,36 @@ def send_top_report():
     send_telegram("\n".join(lines))
 
 
-# ── WebSocket handlers ───────────────────────────────────
+# ── WebSocket обработчики ────────────────────────────────
 def on_message(ws, message):
     try:
-        data = json.loads(message)
-        if data.get("op") in ("ping", "pong"):
-            return
-        topic = data.get("topic", "")
+        data   = json.loads(message)
+        topic  = data.get("topic", "")
+
         if not topic.startswith("tickers."):
             return
-        td = data.get("data", {})
+
+        td     = data.get("data", {})
         symbol = td.get("symbol", "")
+
         if not symbol.endswith("USDT"):
             return
+
         try:
-            price   = float(td.get("lastPrice")        or 0)
-            vol     = float(td.get("turnover24h")       or 0)
-            change  = float(td.get("price24hPcnt")      or 0) * 100
-            oi      = float(td.get("openInterestValue") or 0)
+            price  = float(td.get("lastPrice")        or 0)
+            vol    = float(td.get("turnover24h")       or 0)
+            change = float(td.get("price24hPcnt")      or 0) * 100
+            oi     = float(td.get("openInterestValue") or 0)
         except (ValueError, TypeError):
             return
-        if price <= 0:
-            return
+
         info = {"price": price, "volume_24h": vol, "change_pct": change, "oi_value": oi}
+
         with lock:
             tickers[symbol] = info
+
         check_spike(symbol, info)
+
     except Exception as e:
         log.error(f"on_message: {e}")
 
@@ -194,38 +230,79 @@ def on_close(ws, code, msg):
 
 
 def on_open(ws):
-    log.info("WS подключён — подписываемся...")
-    # Получаем список монет через REST
-    symbols = []
-    try:
-        r = requests.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "linear"}, timeout=15
-        )
-        if r.status_code == 200 and r.text.strip().startswith("{"):
-            data = r.json()
-            if data.get("retCode") == 0:
-                symbols = [t["symbol"] for t in data["result"]["list"] if t["symbol"].endswith("USDT")]
-    except Exception as e:
-        log.warning(f"REST failed: {e}")
+    """
+    Bybit поддерживает подписку через REST + WS.
+    Получаем список монет через несколько источников.
+    """
+    log.info("WS подключён — получаем список всех монет...")
 
+    symbols = []
+
+    # Попытка 1 — Bybit REST
+    for url in ["https://api.bybit.com/v5/market/tickers",
+                "https://api.bytick.com/v5/market/tickers"]:
+        try:
+            r = requests.get(url, params={"category": "linear"},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                data = r.json()
+                if data.get("retCode") == 0:
+                    symbols = [t["symbol"] for t in data["result"]["list"]
+                               if t["symbol"].endswith("USDT")]
+                    log.info(f"Bybit REST OK: {len(symbols)} монет")
+                    break
+        except Exception as e:
+            log.warning(f"Bybit REST failed ({url}): {e}")
+
+    # Попытка 2 — если REST не сработал, используем большой список вручную
     if not symbols:
-        symbols = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT",
-                   "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT"]
+        log.info("Используем встроенный список монет...")
+        symbols = [
+            # Топ по объёму
+            "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","DOGEUSDT",
+            "ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT","LINKUSDT","UNIUSDT",
+            "ATOMUSDT","LTCUSDT","ETCUSDT","APTUSDT","ARBUSDT","OPUSDT",
+            "INJUSDT","SUIUSDT","SEIUSDT","TIAUSDT","JUPUSDT","WLDUSDT",
+            "FETUSDT","RNDRUSDT","GRTUSDT","AAVEUSDT","MKRUSDT","SNXUSDT",
+            # Твои монеты
+            "RIVERUSDT","SKRUSDT","TRUMPUSDT","HYPEUSDT","BERUSDT",
+            "ORCAUSDT","TAOUSDT","STOUSDT","PIPPINUSDT","AZTECUSDT",
+            "RDNTUSDT","ICPUSDT","STGUSDT","BLUAIUSDT","ENSOUST",
+            "SIRENUSDT","RAVEUSDT","RESOLVUSDT","MOODENGUSDT","LYNUSDT",
+            # Популярные альты
+            "NEARUSDT","FILUSDT","ALGOUSDT","VETUSDT","XTZUSDT","EGLDUSDT",
+            "FLOWUSDT","ICPUSDT","HNTUSDT","RUNEUSDT","KAVAUSDT","BANDUSDT",
+            "CELOUSDT","ZILUSDT","IOTAUSDT","ONEUSDT","ANKRUSDT","SKLUSDT",
+            "CRVUSDT","COMPUSDT","YFIUSDT","SUSHIUSDT","BALUSDT","RENUSDT",
+            "STORJUSDT","ENJUSDT","MANAUSDT","SANDUSDT","AXSUSDT","GALAUSDT",
+            "DYDXUSDT","GMXUSDT","PERPUSDT","BLURUSDT","LDOUSDT","RPLУСДТ",
+            "STETHUSDT","FRAXUSDT","FXSUSDT","CVXUSDT","FLOKIUSDT","PEPEUSDT",
+            "WIFUSDT","BONKUSDT","MEMEUSDT","SHIBUSDT","BOMEUSDT","POPCATUSDT",
+            "NOTUSDT","EIGENUSDT","SCRUSDT","ZROUSDT","ZKUSDT","ALTUSDT",
+            "DYMUSDT","PYTHUSDT","JITOUSDT","WUSDT","STRKUSDT","PIXELUSDT",
+            "PORTALUSDT","AEVOUSDT","SAGAUSDT","ZETAUSDT","ALTUSDT","ACEUSDT",
+            "XAIUSDT","MANTAUSDT","TAIKO","ETHFIUSDT","RENZOUSDT","BBUSDT",
+        ]
 
     log.info(f"Подписываемся на {len(symbols)} монет")
+
+    # Подписываемся батчами по 10
     for i in range(0, len(symbols), 10):
         batch = [f"tickers.{s}" for s in symbols[i:i+10]]
         ws.send(json.dumps({"op": "subscribe", "args": batch}))
         time.sleep(0.05)
 
-    log.info("Готово — слушаем рынок в реальном времени!")
+    # Добавляем в known_coins чтобы не слать сигнал о "новом листинге" при старте
+    known_coins.update(symbols)
+
+    log.info(f"Готово! Слушаем {len(symbols)} монет в реальном времени")
     send_telegram(
         f"<b>Bybit Volume Bot запущен!</b>\n"
         f"Режим: WebSocket (реальное время)\n"
-        f"Монет: {len(symbols)}\n"
+        f"Монет отслеживается: <b>{len(symbols)}</b>\n"
         f"Мин. объём: {fmt_vol(MIN_VOLUME_USD)}\n"
-        f"Порог всплеска: x{SPIKE_MULTIPLIER}"
+        f"Порог всплеска: x{SPIKE_MULTIPLIER}\n"
+        f"Новые листинги: отслеживаются"
     )
 
 
@@ -257,17 +334,12 @@ def run_websocket():
         time.sleep(5)
 
 
-# ── Главная функция ──────────────────────────────────────
 def main():
     log.info("Запуск Bybit Volume Bot...")
     log.info(f"TELEGRAM_TOKEN:   {'OK' if TELEGRAM_TOKEN else 'НЕ ЗАДАН!'}")
     log.info(f"TELEGRAM_CHAT_ID: {'OK' if TELEGRAM_CHAT_ID else 'НЕ ЗАДАН!'}")
 
-    # HTTP сервер в отдельном потоке (нужен для Railway)
-    http_thread = threading.Thread(target=run_http, daemon=True)
-    http_thread.start()
-
-    # WebSocket в основном потоке
+    threading.Thread(target=run_http, daemon=True).start()
     run_websocket()
 
 
